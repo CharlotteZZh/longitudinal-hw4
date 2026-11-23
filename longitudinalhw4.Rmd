@@ -1,0 +1,215 @@
+---
+title: "P8157 Homework 4"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = "")
+```
+
+## Question 1
+
+`glmmLogitRI()` fits a logistic random intercepts GLMM using adaptive Gauss–Hermite quadrature.
+Its inputs are the same as `glmer()` (`formula`, `data`, `nAGQ`) except `family`. With `nAGQ = 1` it uses the Laplace approximation.
+
+```{r functions}
+## ---------------------------------------------------------------
+## Gauss-Hermite nodes and weights (Golub-Welsch algorithm)
+##    for integrals of the form  int f(x) exp(-x^2) dx
+## ---------------------------------------------------------------
+gauss_hermite <- function(n) {
+  if (n == 1) return(list(x = 0, w = sqrt(pi)))
+  J <- matrix(0, n, n)
+  off <- sqrt(seq_len(n - 1) / 2)          # off-diagonal of Jacobi matrix
+  J[cbind(1:(n - 1), 2:n)] <- off
+  J[cbind(2:n, 1:(n - 1))] <- off
+  e <- eigen(J, symmetric = TRUE)
+  list(x = e$values, w = sqrt(pi) * e$vectors[1, ]^2)
+}
+
+## ---------------------------------------------------------------
+## Main fitting function
+##    formula : e.g. y ~ x1 + x2 + (1 | id)   (random intercept only)
+##    data    : data frame
+##    nAGQ    : number of adaptive quadrature points (1 = Laplace)
+## ---------------------------------------------------------------
+glmmLogitRI <- function(formula, data, nAGQ = 1) {
+
+  # Parse the formula: split fixed part and grouping factor
+  terms_all <- attr(terms(formula), "term.labels")    
+  is_re     <- grepl("|", terms_all, fixed = TRUE)    # which term is (1 | group)
+  if (sum(is_re) != 1) stop("formula must contain one (1 | group) term")
+  group     <- trimws(strsplit(terms_all[is_re], "|", fixed = TRUE)[[1]][2])
+  fixed_terms <- terms_all[!is_re]
+  if (length(fixed_terms) == 0) fixed_terms <- "1"
+  fixed_formula <- reformulate(fixed_terms, response = formula[[2]])
+
+  # Build response, design matrix, cluster index 
+  mf <- model.frame(update(fixed_formula, . ~ . + .grp),
+                    data = cbind(data, .grp = data[[group]]))
+  y  <- model.response(mf)
+  X  <- model.matrix(fixed_formula, mf)
+  id <- as.integer(factor(mf$.grp))        
+  K  <- max(id); p <- ncol(X)
+
+  gh <- gauss_hermite(nAGQ)
+
+  # Mode of each cluster's integrand (Newton-Raphson) 
+  # log f_k(g) = sum_i [y (eta + g) - log(1+exp(eta + g))] - g^2/(2 s2) + const
+  find_modes <- function(eta, s2) {
+    g <- rep(0, K)
+    for (it in 1:50) {
+      mu   <- plogis(eta + g[id])
+      grad <- rowsum(y - mu, id)[, 1] - g / s2
+      hess <- rowsum(mu * (1 - mu), id)[, 1] + 1 / s2   # = -d2 log f
+      step <- pmax(pmin(grad / hess, 5), -5)   # damped Newton step
+      g <- g + step
+      if (max(abs(step)) < 1e-10) break
+    }
+    mu <- plogis(eta + g[id])
+    list(g = g, h = rowsum(mu * (1 - mu), id)[, 1] + 1 / s2)
+  }
+
+  # log f_k evaluated at a vector of values g (one per cluster) 
+  log_f <- function(eta, g, s2) {
+    lin <- eta + g[id]
+    # plogis(-lin, log.p = TRUE) = -log(1 + exp(lin)), computed stably
+    rowsum(y * lin + plogis(-lin, log.p = TRUE), id)[, 1] +
+      dnorm(g, 0, sqrt(s2), log = TRUE)
+  }
+
+  # Marginal log-likelihood via adaptive GH quadrature 
+  # theta = (beta, log sigma)
+  loglik <- function(theta) {
+    beta <- theta[1:p]
+    s2   <- exp(2 * min(max(theta[p + 1], -10), 5))   # keep sigma in a sane range
+    eta  <- drop(X %*% beta)
+    md   <- find_modes(eta, s2)
+    s    <- 1 / sqrt(md$h)
+    # matrix K x Q of log integrand values at the shifted / scaled nodes
+    lf <- sapply(seq_along(gh$x), function(q)
+      log_f(eta, md$g + sqrt(2) * s * gh$x[q], s2) + log(gh$w[q]) + gh$x[q]^2)
+    lf <- matrix(lf, nrow = K)
+    m  <- apply(lf, 1, max)                  # log-sum-exp for stability
+    sum(log(sqrt(2) * s) + m + log(rowSums(exp(lf - m))))
+  }
+
+  # Maximise: start from ordinary logistic regression 
+  start <- c(coef(glm.fit(X, y, family = binomial())), log(1))
+  opt <- optim(start, function(th) -loglik(th), method = "BFGS",
+               control = list(maxit = 500, reltol = 1e-12))
+
+  # Standard errors from numerical Hessian on (beta, sigma^2) scale 
+  negll_v <- function(par) -loglik(c(par[1:p], 0.5 * log(par[p + 1])))
+  est_v   <- c(opt$par[1:p], exp(2 * opt$par[p + 1]))
+  H       <- optimHess(est_v, negll_v)
+  V       <- solve(H)
+
+  beta <- opt$par[1:p]; names(beta) <- colnames(X)
+  vb   <- V[1:p, 1:p, drop = FALSE]; dimnames(vb) <- list(colnames(X), colnames(X))
+
+  structure(list(
+    call = match.call(), formula = formula, group = group, nAGQ = nAGQ,
+    coefficients = beta, vcov = vb,
+    sigma2 = est_v[p + 1], se.sigma2 = sqrt(V[p + 1, p + 1]),
+    logLik = -opt$value, npar = p + 1,
+    nobs = length(y), ngroups = K, convergence = opt$convergence),
+    class = "glmmLogitRI")
+}
+
+## ---------------------------------------------------------------
+## Print method (mimics summary() of a glmer fit)
+## ---------------------------------------------------------------
+print.glmmLogitRI <- function(x, digits = 4, ...) {
+  method <- if (x$nAGQ == 1) "Laplace Approximation" else
+    paste0("Adaptive Gauss-Hermite Quadrature, nAGQ = ", x$nAGQ)
+  writeLines("Logistic random intercepts GLMM fit by maximum likelihood")
+  writeLines(paste0("  (", method, ")"))
+  writeLines(" Family: binomial  ( logit )")
+  writeLines(paste("Formula:", paste(deparse(x$formula), collapse = "")))
+  writeLines("")
+
+  ll  <- x$logLik
+  fit <- c(AIC = -2 * ll + 2 * x$npar, BIC = -2 * ll + log(x$nobs) * x$npar,
+           logLik = ll, deviance = -2 * ll)
+  print(c(format(round(fit, 1), nsmall = 1), df.resid = x$nobs - x$npar),
+        quote = FALSE)
+
+  writeLines(c("", "Random effects:"))
+  re <- data.frame(Groups = x$group, Name = "(Intercept)",
+                   Variance = formatC(x$sigma2, format = "f", digits = digits),
+                   Std.Dev. = formatC(sqrt(x$sigma2), format = "f", digits = digits))
+  print(format(re, justify = "left"), row.names = FALSE, right = FALSE)
+  writeLines(paste0("Number of obs: ", x$nobs, ", groups:  ", x$group, ", ",
+                    x$ngroups))
+
+  writeLines(c("", "Fixed effects:"))
+  se <- sqrt(diag(x$vcov)); z <- x$coefficients / se
+  tab <- cbind(Estimate = x$coefficients, `Std. Error` = se,
+               `z value` = z, `Pr(>|z|)` = 2 * pnorm(-abs(z)))
+  printCoefmat(tab, digits = digits, signif.stars = TRUE)
+  if (x$convergence != 0) writeLines(c("", "Warning: optimizer did not converge"))
+  invisible(x)
+}
+```
+
+### Application to the ICHS data 
+
+```{r ichs, message=FALSE}
+load("ICHS.RData")
+dim(ichs)
+length(unique(ichs$id))
+
+my.RI.01 <- glmmLogitRI(infection ~ xerop + age + (1 | id), data = ichs)
+my.RI.01
+```
+
+These results match the `glmer()` fit on slides 369–370: the maximized log-likelihood is $-344.8$,
+$\hat\sigma^2_\gamma = 0.826$ (SD $= 0.909$), and the fixed effects are $\hat\beta_0 = -2.682$ (SE $0.183$),
+$\hat\beta_{\text{xerop}} = 0.511$ (SE $0.486$), and $\hat\beta_{\text{age}} = -0.027$ (SE $0.0067$).
+
+## Question 2
+
+**Features shared by both frameworks**
+
+* Both handle correlated outcomes (clusters or repeated measures on the same subject).
+* Both extend GLMs: same outcome types (binary, count, continuous), link functions, and linear predictor $\boldsymbol X^T\boldsymbol\beta$.
+* Both give regression coefficients with standard errors, CIs, and Wald tests.
+* Both can include time-varying and time-invariant covariates, and both can handle unbalanced data and unequal cluster sizes.
+* For a linear model with identity link, the marginal and conditional $\boldsymbol\beta$ have the same interpretation.
+* Both need enough clusters for the asymptotics to be reliable.
+
+**Reasons to use marginal models (GEE)**
+
+* The scientific question is population-averaged, e.g., "how does the prevalence of infection differ between children with and without xerophthalmia?" This is the usual question in public health and policy.
+* Only the mean model needs to be correct. The working correlation can be wrong, and the robust (sandwich) SEs still give valid inference.
+* No distributional assumptions about random effects, so less can go wrong.
+* Coefficients are easy to explain because they keep the usual GLM interpretation (e.g., population odds ratios).
+* Computation is fast and stable, even with many clusters or a non-identity link.
+
+**Reasons not to use marginal models**
+
+* GEE is not likelihood-based, so there's no likelihood ratio test, AIC, or BIC.
+* Valid only under MCAR missingness, a stronger assumption than likelihood methods need (MAR). With dropout, estimates can be biased unless weighted GEE is used.
+* Sandwich SEs can be unreliable with few clusters.
+* Gives no subject-specific estimates and doesn't describe how much subjects vary (no variance components or predictions for individuals).
+* The working correlation is a nuisance and is not well suited to studying the dependence structure itself.
+* With time-varying covariates and a non-independence working correlation, estimates can be biased unless the covariates are exogenous.
+
+**Reasons to use mixed models (GLMMs)**
+
+* The question is subject-specific, e.g., "how does a given child's risk change if they develop xerophthalmia?" This is often the question for clinical decisions or within-subject effects.
+* Likelihood-based: valid under MAR missingness, and allows likelihood ratio tests, AIC/BIC, and model comparison.
+* Estimates the between-subject variability ($\sigma^2_\gamma$), which can be of scientific interest, and gives predictions for individual subjects (BLUPs).
+* Can handle multilevel or crossed structures, random slopes, and small or unbalanced clusters.
+* Fully specifies the data-generating process, so it can be used for simulation and prediction.
+
+**Reasons not to use mixed models**
+
+* With a non-identity link, $\boldsymbol\beta$ is conditional on the random effect and is not a population-averaged effect. Conditional effects are larger in magnitude than marginal ones, and readers often misinterpret them.
+* Relies on correct specification of the random effects distribution (usually normal) and of which effects are random. If these are wrong, both $\boldsymbol\beta$ and the SEs can be biased.
+* Estimation requires numerical integration (Laplace or quadrature), which can be slow, unstable, or inaccurate (e.g., Laplace with binary data and small clusters). Results may depend on the number of quadrature points.
+* Effects of between-cluster covariates (e.g., treatment arm) are harder to explain because each one compares two people with the same random effect.
+* Inference about variance components is awkward (the null value is on the boundary of the parameter space, and the variance estimate can be zero).
